@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stock Timing Checklist: indicator calculator. Python 3.8+, standard library only, no API key.
+"""Investing Agent: indicator calculator. Python 3.8+, standard library only, no API key.
 
 Three ways to feed it daily prices (oldest or newest first, either is fine):
 
@@ -13,9 +13,19 @@ Three ways to feed it daily prices (oldest or newest first, either is fine):
                                              [date, close, high, low, volume]
 
 It prints the numbers behind the checklist: moving averages and their slope, 52-week high,
-volume behaviour, RSI(14), MACD(12,26,9), swing support/resistance and the 5-point Stage 2
-checklist. It does not judge. The AI (or you) does that with PROMPT.md and KB.md.
+volume behaviour, RSI(14), MACD(12,26,9), swing support/resistance, the 5-point Stage 2
+checklist and a QUANT block (volatility, momentum, drawdown, z-score, ATR, beta, size). It does not judge. The AI (or you) does that with PROMPT.md and KB.md.
 Use at least 260 trading days so the 200-day average and its slope exist.
+
+Optional flags (after the data argument) sharpen the QUANT block (KB W-rules):
+  --bench FILE     benchmark candles (CSV or JSON) → beta, correlation, 3m/6m/12m vs bench.
+                   The --yahoo route fetches SPY (or 2800.HK) itself, so no file is needed there.
+  --risk AMOUNT    how much you are willing to lose if the stop is hit, in YOUR home currency
+                   → position size (W-011). Common default: 2% of your pot.
+  --fx RATE        home currency per 1 unit of the price currency (e.g. 7.8 for USD→HKD);
+                   default 1 (prices already in your home currency)
+  --pot AMOUNT     total pot in your home currency, so the size is also shown as % of pot
+Crypto (candles on weekends) is annualised with 365 periods/year, stocks with 252.
 """
 import csv
 import json
@@ -141,10 +151,142 @@ def fmt(x, d=2):
     return "n/a" if x is None else f"{x:,.{d}f}"
 
 
+def _std(xs):
+    if len(xs) < 2:
+        return None
+    m = sum(xs) / len(xs)
+    return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+
+
+def _pct(x, d=1):
+    return "n/a" if x is None else f"{x * 100:+.{d}f}%"
+
+
+def atr(h, l, c, n=14):
+    if len(c) <= n:
+        return None
+    trs = [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, len(c))]
+    a = sum(trs[:n]) / n
+    for t in trs[n:]:
+        a = (a * (n - 1) + t) / n  # Wilder smoothing
+    return a
+
+
+def quant_block(dates, c, h, l, opts):
+    """Quant desk numbers (KB W-001…). Prints facts only; the agent judges."""
+    import datetime as dt
+    n = len(c)
+    weekend = any(dt.date.fromisoformat(d).weekday() >= 5 for d in dates[-30:])
+    A = 365 if weekend else 252          # periods per year
+    M = round(A / 12)                     # periods per month (21 stocks, 30 crypto)
+    rets = [c[i] / c[i - 1] - 1 for i in range(1, n)]
+    print(f"\nQUANT block ({'crypto, 365' if weekend else 'stock, 252'} periods/yr)")
+
+    v20 = _std(rets[-20:]) * A ** 0.5 if len(rets) >= 20 else None
+    v60 = _std(rets[-60:]) * A ** 0.5 if len(rets) >= 60 else None
+    vp = lambda x: "n/a" if x is None else f"{x * 100:.1f}%"
+    print(f"Volatility (annualised): 20d {vp(v20)} · 60d {vp(v60)}"
+          + (f"  ← rising (20d > 60d)" if v20 and v60 and v20 > v60 * 1.1 else ""))
+
+    def ret_over(k, skip=0):
+        if n <= k:
+            return None
+        return c[-1 - skip] / c[-1 - k] - 1
+
+    r1m, r3m, r6m, r12m = ret_over(M), ret_over(3 * M), ret_over(6 * M), ret_over(A)
+    mom = ret_over(A, skip=M)  # 12-1 momentum: t-12m → t-1m, skipping the last month
+    print(f"Returns: 1m {_pct(r1m)} · 3m {_pct(r3m)} · 6m {_pct(r6m)} · 12m {_pct(r12m)}")
+    print(f"12-1 momentum (skip last month): {_pct(mom)}"
+          + ("" if mom is not None else f"  (needs >{A} candles; fetch more)"))
+    if r12m is not None:
+        print(f"Time-series momentum sign (12m): {'positive → trend up' if r12m > 0 else 'negative → trend down'}")
+
+    win = c[-A:] if n >= A else c
+    peak, mdd = win[0], 0.0
+    for x in win:
+        peak = max(peak, x)
+        mdd = min(mdd, x / peak - 1)
+    cur_dd = c[-1] / max(win) - 1
+    print(f"Max drawdown ({'1y' if n >= A else f'{len(win)}d'}): {_pct(mdd)} · current drawdown from peak {_pct(cur_dd)}")
+
+    yr = rets[-A:] if len(rets) >= A else rets
+    s = _std(yr)
+    if s:
+        mu = sum(yr) / len(yr)
+        sharpe = mu * A / (s * A ** 0.5)
+        downs = [min(x, 0) for x in yr]
+        dd = (sum(x * x for x in downs) / len(downs)) ** 0.5
+        sortino = mu * A / (dd * A ** 0.5) if dd else None
+        print(f"Sharpe proxy ({len(yr)}d, rf=0, iid √{A} scaling): {fmt(sharpe)} · Sortino proxy {fmt(sortino)}")
+
+    m50 = sma(c, 50)
+    s50 = _std(c[-50:]) if n >= 50 else None
+    z = (c[-1] - m50) / s50 if m50 and s50 else None
+    print(f"Z-score vs 50DMA: {fmt(z)}" + ("  ← stretched (|z|>2)" if z is not None and abs(z) > 2 else ""))
+
+    a14 = atr(h, l, c)
+    print(f"ATR14: {fmt(a14)} ({_pct(a14 / c[-1] if a14 else None)} of price) · 2×ATR stop = {fmt(c[-1] - 2 * a14 if a14 else None)}")
+
+    if opts.get("bench"):
+        try:
+            src = opts["bench"]
+            raw = src if isinstance(src, list) else (load_csv(src) if src.lower().endswith(".csv") else load_json(src))
+            b = sorted([r for r in raw if r[1] is not None], key=lambda x: x[0])
+            bmap = {r[0]: r[1] for r in b}
+            common = [d for d in dates if d in bmap]
+            cm = {d: x for d, x in zip(dates, c)}
+            pairs = [(cm[common[i]] / cm[common[i - 1]] - 1, bmap[common[i]] / bmap[common[i - 1]] - 1)
+                     for i in range(1, len(common))][-252:]
+            if len(pairs) >= 60:
+                xs, ys = [p[1] for p in pairs], [p[0] for p in pairs]
+                mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+                cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / (len(xs) - 1)
+                beta = cov / _std(xs) ** 2
+                corr = cov / (_std(xs) * _std(ys))
+                print(f"Beta vs bench ({len(pairs)} shared days): {fmt(beta)} · correlation {fmt(corr)}")
+            bc = [r[1] for r in b]
+            for lab, k in (("3m", 63), ("6m", 126), ("12m", 252)):
+                kk = k if not weekend else round(k * 365 / 252)
+                mine = ret_over(kk)
+                theirs = bc[-1] / bc[-1 - k] - 1 if len(bc) > k else None
+                if mine is not None and theirs is not None:
+                    print(f"  {lab}: {_pct(mine)} vs bench {_pct(theirs)} → {'beating' if mine > theirs else 'lagging'}")
+        except Exception as e:  # bad file: say so, never guess
+            print(f"Beta/relative strength: unknown (bench file error: {e})")
+    else:
+        print("Beta/relative strength: unknown (no --bench file)")
+
+    if opts.get("risk") and a14:
+        fx = opts.get("fx", 1.0)
+        stop_hkd = 2 * a14 * fx
+        units = opts["risk"] / stop_hkd
+        notional = units * c[-1] * fx
+        line = (f"Size (W-011): risk {opts['risk']:,.0f} ÷ 2×ATR ({stop_hkd:,.2f}/unit) = {units:,.4f} units"
+                f" ≈ {notional:,.0f} position (home currency)")
+        if opts.get("pot"):
+            line += f" = {notional / opts['pot'] * 100:.1f}% of pot"
+        print(line)
+
+
+def parse_opts(argv):
+    opts, i = {}, 0
+    while i < len(argv):
+        k = argv[i]
+        if k in ("--bench", "--risk", "--fx", "--pot") and i + 1 < len(argv):
+            v = argv[i + 1]
+            opts[k[2:]] = v if k == "--bench" else float(v)
+            i += 2
+        else:
+            i += 1
+    return opts
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         sys.exit(__doc__)
-    rows = load(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
+    opts = parse_opts(sys.argv[2:])
+    sym2 = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None
+    rows = load(sys.argv[1], sym2)
     if len(rows) < 30:
         sys.exit(f"Only {len(rows)} candles; need at least 30.")
     dates = [r[0] for r in rows]
@@ -254,6 +396,13 @@ def main():
         unknown = (name.startswith("b") or name.startswith("c")) and ma[200] is None
         print(f"  {'n/a' if unknown else '✅' if ok else '❌'} {name}")
     print(f"  Score: {sum(ok for _, ok in chk)}/5")
+
+    if BENCH and not opts.get("bench"):
+        try:
+            opts["bench"] = load_yahoo(BENCH, quiet=True)
+        except SystemExit:
+            pass
+    quant_block(dates, c, h, l, opts)
 
 
 if __name__ == "__main__":
